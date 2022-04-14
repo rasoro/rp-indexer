@@ -151,8 +151,6 @@ func main() {
 
 		// cleanup our aliases if appropriate
 		if config.Cleanup {
-			log.Println("CLEANAPED")
-			log.Println("CLEANAPED_______________________________________")
 			err := indexer.CleanupIndexes(config.ElasticURL, config.Index)
 			if err != nil {
 				logError(config.Rebuild, err, "error cleaning up aliases")
