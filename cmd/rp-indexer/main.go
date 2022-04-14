@@ -13,25 +13,31 @@ import (
 )
 
 type config struct {
-	ElasticURL string `help:"the url for our elastic search instance"`
-	DB         string `help:"the connection string for our database"`
-	Index      string `help:"the alias for our contact index"`
-	Poll       int    `help:"the number of seconds to wait between checking for updated contacts"`
-	Rebuild    bool   `help:"whether to rebuild the index, swapping it when complete, then exiting (default false)"`
-	Cleanup    bool   `help:"whether to remove old indexes after a rebuild"`
-	LogLevel   string `help:"the log level, one of error, warn, info, debug"`
-	SentryDSN  string `help:"the sentry configuration to log errors to, if any"`
+	ElasticURL      string `help:"the url for our elastic search instance"`
+	DB              string `help:"the connection string for our database"`
+	Index           string `help:"the alias for our contact index"`
+	Poll            int    `help:"the number of seconds to wait between checking for updated contacts"`
+	Rebuild         bool   `help:"whether to rebuild the index, swapping it when complete, then exiting (default false)"`
+	Cleanup         bool   `help:"whether to remove old indexes after a rebuild"`
+	LogLevel        string `help:"the log level, one of error, warn, info, debug"`
+	SentryDSN       string `help:"the sentry configuration to log errors to, if any"`
+	IndexByInterval bool   `help:"index contacts within interval"`
+	After           string `help:"date time after contact last modified to index if is indexing in interval"`
+	Before          string `help:"date time before contact last modified to index if indexing in interval"`
 }
 
 func main() {
 	config := config{
-		ElasticURL: "http://localhost:9200",
-		DB:         "postgres://localhost/temba?sslmode=disable",
-		Index:      "contacts",
-		Poll:       5,
-		Rebuild:    false,
-		Cleanup:    false,
-		LogLevel:   "info",
+		ElasticURL:      "http://localhost:9200",
+		DB:              "postgres://temba:temba@localhost/temba?sslmode=disable",
+		Index:           "contacts",
+		Poll:            5,
+		Rebuild:         false,
+		Cleanup:         false,
+		LogLevel:        "info",
+		IndexByInterval: false,
+		After:           time.Time{}.Format(time.RFC3339),
+		Before:          time.Now().Format(time.RFC3339),
 	}
 	loader := ezconf.NewLoader(&config, "indexer", "Indexes RapidPro contacts to ElasticSearch", []string{"indexer.toml"})
 	loader.MustLoad()
@@ -88,6 +94,34 @@ func main() {
 			remapAlias = true
 		}
 
+		if config.IndexByInterval {
+			start := time.Now()
+			after, err := time.Parse(time.RFC3339, config.After)
+			if err != nil {
+				log.Fatal(err)
+			}
+			before, err := time.Parse(time.RFC3339, config.Before)
+			if err != nil {
+				log.Fatal(err)
+			}
+			indexed, deleted, err := indexer.IndexContactsLastModifiedWithinInterval(db, config.ElasticURL, physicalIndex, after, before)
+			if err != nil {
+				logError(config.Rebuild, err, "error indexing contacts")
+				continue
+			}
+			log.WithField("added", indexed).WithField("deleted", deleted).WithField("index", physicalIndex).WithField("elapsed", time.Now().Sub(start)).Info("completed indexing")
+			if remapAlias {
+				err := indexer.MapIndexAlias(config.ElasticURL, config.Index, physicalIndex)
+				if err != nil {
+					logError(config.Rebuild, err, "error remapping alias")
+					continue
+				}
+				remapAlias = false
+			}
+
+			os.Exit(0)
+		}
+
 		lastModified, err := indexer.GetLastModified(config.ElasticURL, physicalIndex)
 		if err != nil {
 			logError(config.Rebuild, err, "error finding last modified")
@@ -117,6 +151,8 @@ func main() {
 
 		// cleanup our aliases if appropriate
 		if config.Cleanup {
+			log.Println("CLEANAPED")
+			log.Println("CLEANAPED_______________________________________")
 			err := indexer.CleanupIndexes(config.ElasticURL, config.Index)
 			if err != nil {
 				logError(config.Rebuild, err, "error cleaning up aliases")

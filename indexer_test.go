@@ -299,6 +299,22 @@ func TestIndexing(t *testing.T) {
 	// 3 is no longer in our group
 	assertQuery(t, client, indexName, elastic.NewMatchQuery("groups", "529bac39-550a-4d6f-817c-1833f3449007"), []int64{1})
 
+	// update our database, removing one contact, updating another
+	dbUpdate2, err := ioutil.ReadFile("testdb_update2.sql")
+	assert.NoError(t, err)
+	_, err = db.Exec(string(dbUpdate2))
+	assert.NoError(t, err)
+
+	before, err := time.Parse(time.RFC3339, "2011-01-02T15:04:05Z")
+	added, deleted, err = IndexContactsLastModifiedWithinInterval(db, elasticURL, indexName, time.Time{}, before)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, added)
+	assert.Equal(t, 0, deleted)
+
+	time.Sleep(5 * time.Second)
+
+	// should only match new john, old john is gone
+	assertQuery(t, client, indexName, elastic.NewMatchQuery("name", "fulano"), []int64{1})
 }
 func TestRetryServer(t *testing.T) {
 	responseCounter := 0

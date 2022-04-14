@@ -348,6 +348,106 @@ func IndexContacts(db *sql.DB, elasticURL string, index string, lastModified tim
 	return createdCount, deletedCount, nil
 }
 
+func IndexContactsLastModifiedWithinInterval(db *sql.DB, elasticURL string, index string, after time.Time, before time.Time) (int, int, error) {
+	batch := strings.Builder{}
+	createdCount, deletedCount, processedCount := 0, 0, 0
+
+	if index == "" {
+		return createdCount, deletedCount, fmt.Errorf("empty index passed to IndexContacts")
+	}
+
+	var modifiedOn time.Time
+	var contactJSON string
+	var id, orgID int64
+	var isActive bool
+	lastModified := after
+
+	start := time.Now()
+
+	for {
+		rows, err := db.Query(contactQuery2, lastModified, before)
+
+		queryCreated := 0
+		queryCount := 0
+		queryModified := lastModified
+
+		// no more rows? return
+		if err == sql.ErrNoRows {
+			return 0, 0, nil
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			err = rows.Scan(&orgID, &id, &modifiedOn, &isActive, &contactJSON)
+			if err != nil {
+				return 0, 0, err
+			}
+
+			queryCount++
+			processedCount++
+			lastModified = modifiedOn
+
+			if isActive {
+				log.WithField("id", id).WithField("modifiedOn", modifiedOn).WithField("contact", contactJSON).Debug("modified contact")
+				batch.WriteString(fmt.Sprintf(indexCommand, id, modifiedOn.UnixNano(), orgID))
+				batch.WriteString("\n")
+				batch.WriteString(contactJSON)
+				batch.WriteString("\n")
+			} else {
+				log.WithField("id", id).WithField("modifiedOn", modifiedOn).Debug("deleted contact")
+				batch.WriteString(fmt.Sprintf(deleteCommand, id, modifiedOn.UnixNano(), orgID))
+				batch.WriteString("\n")
+			}
+
+			// write to elastic search in batches
+			if queryCount%batchSize == 0 {
+				created, deleted, err := IndexBatch(elasticURL, index, batch.String())
+				if err != nil {
+					return 0, 0, err
+				}
+				batch.Reset()
+
+				queryCreated += created
+				createdCount += created
+				deletedCount += deleted
+			}
+		}
+
+		if batch.Len() > 0 {
+			created, deleted, err := IndexBatch(elasticURL, index, batch.String())
+			if err != nil {
+				return 0, 0, err
+			}
+
+			queryCreated += created
+			createdCount += created
+			deletedCount += deleted
+			batch.Reset()
+		}
+
+		// last modified stayed the same and we didn't add anything, seen it all, break out
+		if lastModified.Equal(queryModified) && queryCreated == 0 {
+			break
+		}
+
+		elapsed := time.Since(start)
+		rate := float32(processedCount) / (float32(elapsed) / float32(time.Second))
+		log.WithFields(map[string]interface{}{
+			"rate":    int(rate),
+			"added":   createdCount,
+			"deleted": deletedCount,
+			"elapsed": elapsed,
+			"index":   index}).Info("updated contact index")
+
+		rows.Close()
+	}
+
+	return createdCount, deletedCount, nil
+}
+
 // MapIndexAlias maps the passed in alias to the new physical index, optionally removing
 // existing aliases if they exit.
 func MapIndexAlias(elasticURL string, alias string, newIndex string) error {
@@ -438,6 +538,68 @@ SELECT org_id, id, modified_on, is_active, row_to_json(t) FROM (
    ) as groups
   FROM contacts_contact
   WHERE modified_on >= $1
+  ORDER BY modified_on ASC
+  LIMIT 500000
+) t;
+`
+
+const contactQuery2 = `
+SELECT org_id, id, modified_on, is_active, row_to_json(t) FROM (
+  SELECT
+   id, org_id, uuid, name, language, status, ticket_count AS tickets, is_active, created_on, modified_on, last_seen_on,
+   EXTRACT(EPOCH FROM modified_on) * 1000000 as modified_on_mu,
+   (
+     SELECT array_to_json(array_agg(row_to_json(u)))
+     FROM (
+            SELECT scheme, path
+            FROM contacts_contacturn
+            WHERE contact_id = contacts_contact.id
+          ) u
+   ) as urns,
+   (
+     SELECT jsonb_agg(f.value)
+     FROM (
+                       select case
+                    when value ? 'ward'
+                      then jsonb_build_object(
+                        'ward_keyword', trim(substring(value ->> 'ward' from  '(?!.* > )([^>]+)'))
+                      )
+                    else '{}' :: jsonb
+                    end || district_value.value as value
+           FROM (
+                  select case
+                           when value ? 'district'
+                             then jsonb_build_object(
+                               'district_keyword', trim(substring(value ->> 'district' from  '(?!.* > )([^>]+)'))
+                             )
+                           else '{}' :: jsonb
+                           end || state_value.value as value
+                  FROM (
+
+                         select case
+                                  when value ? 'state'
+                                    then jsonb_build_object(
+                                      'state_keyword', trim(substring(value ->> 'state' from  '(?!.* > )([^>]+)'))
+                                    )
+                                  else '{}' :: jsonb
+                                  end ||
+                                jsonb_build_object('field', key) || value as value
+                         from jsonb_each(contacts_contact.fields)
+                       ) state_value
+                ) as district_value
+          ) as f
+   ) as fields,
+   (
+     SELECT array_to_json(array_agg(g.uuid))
+     FROM (
+            SELECT contacts_contactgroup.uuid
+            FROM contacts_contactgroup_contacts, contacts_contactgroup
+            WHERE contact_id = contacts_contact.id AND
+                  contacts_contactgroup_contacts.contactgroup_id = contacts_contactgroup.id
+          ) g
+   ) as groups
+  FROM contacts_contact
+  WHERE modified_on >= $1 AND modified_on <= $2
   ORDER BY modified_on ASC
   LIMIT 500000
 ) t;
